@@ -13,16 +13,16 @@ Gli ultimi limiti noti vengono ricordati tra una chat e l'altra e mostrati come 
 Dal prompt di una sessione di Claude Code in terminale:
 
 ```
-/plugin install change-desk --marketplace OWNER/change-desk
+/plugin install change-desk --marketplace gianlucaam04/change-desk
 ```
 
 Da una shell:
 
 ```bash
-claude plugin install change-desk --marketplace OWNER/change-desk
+claude plugin install change-desk --marketplace gianlucaam04/change-desk
 ```
 
-Nell'app desktop, dove `/plugin` non funziona: clicca **+** accanto al prompt, poi **Plugins**, **Add marketplace** con `OWNER/change-desk`, poi **Add plugin**.
+Nell'app desktop, dove `/plugin` non funziona: clicca **+** accanto al prompt, poi **Plugins**, **Add marketplace** con `gianlucaam04/change-desk`, poi **Add plugin**.
 
 Se il repository è privato, l'installazione funziona solo per chi può leggerlo su GitHub e ha già una credenziale git per github.com sul proprio computer (una chiave SSH, oppure `gh auth login` e poi `gh auth setup-git`).
 
