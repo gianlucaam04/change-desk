@@ -12,7 +12,8 @@ export type Change = {
 }
 export type Limit = { kind: string; percent: number; resetsAt?: string }
 export type Meter = {
-  percent: number
+  // null until a response reports the context fill
+  percent: number | null
   tokens: number
   window: number
   usd: number

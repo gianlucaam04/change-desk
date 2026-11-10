@@ -9,7 +9,7 @@ const changes = atom({ plugin: 'change-desk', key: 'changes' } as const, [], {
   shape: 'changes-3',
 })
 const meter = atom({ plugin: 'change-desk', key: 'meter' } as const, null, {
-  shape: 'meter-3',
+  shape: 'meter-4',
 })
 const lastPrompt = atom({ plugin: 'change-desk', key: 'prompt' } as const, '', {
   shape: 'prompt-1',
@@ -24,9 +24,9 @@ const LABELS: Record<string, string> = {
   spend_limit: 'Budget',
 }
 
-const resetIn = (iso?: string) => {
+const resetIn = (now: number, iso?: string) => {
   if (!iso) return ''
-  const mins = Math.max(0, Math.round((Date.parse(iso) - Date.now()) / 60000))
+  const mins = Math.max(0, Math.round((Date.parse(iso) - now) / 60000))
   if (mins >= 1440) return `reset ${Math.floor(mins / 1440)}g ${Math.floor((mins % 1440) / 60)}h`
   return mins >= 60 ? `reset ${Math.floor(mins / 60)}h ${mins % 60}m` : `reset ${mins}m`
 }
@@ -34,12 +34,20 @@ const resetIn = (iso?: string) => {
 const tokens = (n: number) =>
   n >= 1e6 ? `${(n / 1e6).toFixed(1).replace('.0', '')}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
 
-const refresh = async ($: any) => {
-  const u = await $.session.usage()
+// Refreshes can overlap (a tool call, a measurement, a turn's end): only the
+// latest one started may write, so an older reading never overwrites a newer.
+let latestRefresh = 0
+
+// `figures` is a measurement's own input when the caller has one; otherwise
+// the session is asked.
+const refresh = async ($: any, figures?: any) => {
+  const mine = ++latestRefresh
+  const u = figures ?? (await $.session.usage())
+  const now = await $.clock.now()
   const m: Meter = {
-    percent: Math.round(u.context.percent ?? 0),
-    tokens: u.context.tokens ?? 0,
-    window: u.context.window,
+    percent: u.context?.percent === undefined ? null : Math.round(u.context.percent),
+    tokens: u.context?.tokens ?? 0,
+    window: u.context?.window ?? 0,
     usd: u.cost?.usd ?? 0,
     limits: (u.rateLimits ?? []).map((l: any) => ({
       kind: l.kind,
@@ -49,16 +57,23 @@ const refresh = async ($: any) => {
     isStale: false,
   }
   // The server sends the limits with its first answer: until then show the
-  // last ones any session saw, marked stale.
+  // last ones any session saw, marked stale, leaving out windows that have
+  // reset since (their old figure would be wrong).
   if (m.limits.length > 0) {
     await $.store.set('limits', m.limits)
   } else {
     const saved = await $.store.get('limits')
-    if (Array.isArray(saved) && saved.length > 0) {
-      m.limits = saved as Meter['limits']
-      m.isStale = true
+    if (Array.isArray(saved)) {
+      const live = (saved as Meter['limits']).filter(
+        l => l.resetsAt === undefined || Date.parse(l.resetsAt) > now,
+      )
+      if (live.length > 0) {
+        m.limits = live
+        m.isStale = true
+      }
     }
   }
+  if (mine !== latestRefresh) return
   await update($, meter, () => m)
 }
 
@@ -79,9 +94,6 @@ const undoEntries = async ($: any, entries: Change[]) => {
   )
   $.ui.toast(`Annullato: ${new Set(entries.map(c => c.path)).size} file`)
 }
-
-const tone = (percent: number) =>
-  percent < 60 ? 'success' : percent < 85 ? 'warning' : 'error'
 
 // Silent style: grey while healthy, colored only when it needs attention.
 const alert = (percent: number) =>
@@ -116,8 +128,9 @@ export const register: Register = on => {
     return next(e)
   })
 
-  for (const tool of ['Edit', 'Write'] as const) {
-    on('tool.call', { tool }, async ($, e, next) => {
+  {
+    on('tool.call', { tool: ['Edit', 'Write'] }, async ($, e, next) => {
+      const tool = e.tool
       const path = e.file_path
       const turn = await read($, turnNo)
       const prompt = await read($, lastPrompt)
@@ -142,7 +155,7 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     const measured = await next(e)
-    await refresh($)
+    await refresh($, e)
     return measured
   })
 
@@ -156,26 +169,40 @@ export const register: Register = on => {
     const all = (await read($, changes)).filter(c => !c.isUndone)
     const paths = [...new Set(all.map(c => c.path))]
     const m = await read($, meter)
+    const now = await $.clock.now()
     const cols = e.props.bodyColumns ?? 40
     const width = cols >= 56 ? 12 : 8
     const isWide = cols >= 48
 
-    const meterRow = (key: string, label: string, percent: number, note: string) => (
+    const meterRow = (key: string, label: string, percent: number | null, note: string) => (
       <Box key={key} gap={1}>
-        <Box width={14}>
+        <Box width={14} flexShrink={0}>
           <Text dimColor>{label}</Text>
         </Box>
-        <Text color={alert(percent)} dimColor={percent < 60}>
-          {bar(percent, width)}
-        </Text>
-        <Box width={5}>
-          <Text color={alert(percent)} dimColor={percent < 60} bold={percent >= 60}>
-            {percent}%
+        <Box flexShrink={0}>
+          <Text color={percent === null ? undefined : alert(percent)} dimColor={percent === null || percent < 60}>
+            {bar(percent ?? 0, width)}
           </Text>
+        </Box>
+        <Box width={5} flexShrink={0}>
+          {percent === null ? (
+            <Text dimColor>—</Text>
+          ) : (
+            <Text color={alert(percent)} dimColor={percent < 60} bold={percent >= 60}>
+              {percent}%
+            </Text>
+          )}
         </Box>
         {isWide && <Text dimColor>{note}</Text>}
       </Box>
     )
+
+    // A row is a sign, the file's name, its edit count and the button, the last
+    // two in fixed columns: the name is cut to fit so the button never moves.
+    const buttonCols = isWide ? 11 : 4
+    const nameRoom = Math.max(8, cols - 2 - 2 - 4 - buttonCols - 4)
+    const fit = (text: string, room: number) =>
+      text.length <= room ? text : text.slice(0, Math.max(1, room - 1)) + '…'
 
     return (
       <Box flexDirection="column" gap={1} paddingX={1}>
@@ -188,7 +215,7 @@ export const register: Register = on => {
                 l.kind,
                 LABELS[l.kind] ?? l.kind,
                 l.percent,
-                m.isStale ? 'ultimo dato' : resetIn(l.resetsAt),
+                m.isStale ? 'ultimo dato' : resetIn(now, l.resetsAt),
               ),
             )}
           {m !== null &&
@@ -210,26 +237,35 @@ export const register: Register = on => {
           {paths.length === 0 && <Text dimColor>Nessuna modifica in questa sessione.</Text>}
           {paths.map(path => {
             const mine = all.filter(c => c.path === path)
-            const isNew = mine[0].before === null
+            const isNew = mine[0]?.before === null
             const parts = path.split('/')
-            const name = parts[parts.length - 1]
-            const folder = parts.length > 1 ? parts[parts.length - 2] + '/' : ''
+            const name = parts[parts.length - 1] ?? path
+            const folder = parts.length > 1 ? (parts[parts.length - 2] ?? '') + '/' : ''
             const edits = mine.reduce((n, c) => n + c.edits, 0)
+            const shownName = fit(name, nameRoom)
+            const folderRoom = nameRoom - shownName.length - 2
+            const shownFolder = folder !== '' && folderRoom >= 4 ? fit(folder, folderRoom) : ''
             return (
               <Box key={path} gap={1}>
-                <Text color={isNew ? 'success' : undefined} dimColor={!isNew}>
-                  {isNew ? '+' : '~'}
-                </Text>
-                <Box flexGrow={1}>
-                  <Text wrap="truncate-end">
-                    {name}
-                    {folder !== '' && <Text dimColor>  {folder}</Text>}
+                <Box width={1} flexShrink={0}>
+                  <Text color={isNew ? 'success' : undefined} dimColor={!isNew}>
+                    {isNew ? '+' : '~'}
                   </Text>
                 </Box>
-                {edits > 1 && <Text dimColor>×{edits}</Text>}
-                <Button key={`u-${path}`} variant="secondary" onPress={() => undoEntries($, mine)}>
-                  <Text>{isWide ? '↺ Annulla' : '↺'}</Text>
-                </Button>
+                <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                  <Text wrap="truncate-end">
+                    {shownName}
+                    {shownFolder !== '' && <Text dimColor>  {shownFolder}</Text>}
+                  </Text>
+                </Box>
+                <Box width={4} flexShrink={0} justifyContent="flex-end">
+                  <Text dimColor>{edits > 1 ? `×${edits}` : ''}</Text>
+                </Box>
+                <Box width={buttonCols} flexShrink={0} justifyContent="flex-end">
+                  <Button key={`u-${path}`} variant="secondary" onPress={() => undoEntries($, mine)}>
+                    <Text>{isWide ? '↺ Annulla' : '↺'}</Text>
+                  </Button>
+                </Box>
               </Box>
             )
           })}
@@ -293,9 +329,13 @@ export const register: Register = on => {
                 <Text>
                   {dot()}
                   {isFull && <Text dimColor>chat </Text>}
-                  <Text color={alert(m.percent)} dimColor={m.percent < 60} bold={m.percent >= 60}>
-                    {m.percent}%
-                  </Text>
+                  {m.percent === null ? (
+                    <Text dimColor>—</Text>
+                  ) : (
+                    <Text color={alert(m.percent)} dimColor={m.percent < 60} bold={m.percent >= 60}>
+                      {m.percent}%
+                    </Text>
+                  )}
                 </Text>
               )}
               {limits.map(l => (
@@ -325,14 +365,13 @@ export const register: Register = on => {
             $.ui.open({ id: PANE, title: 'Modifiche' }),
           )}
           {action('compact', '⇣', 'Compact', 'Riassume la chat per liberare contesto', async () => {
-            $.ui.toast('Compattazione in corso…')
+            // Sent as if typed: the app runs /compact itself, and queues it
+            // when a turn is still running instead of refusing.
             try {
-              const r = await $.session.compact()
-              $.ui.toast(r.skip ? 'Compact non eseguito' : 'Conversazione compattata')
-            } catch {
-              $.ui.toast('Compact non possibile mentre Claude lavora')
+              await $.prompt.submit({ text: '/compact', asUser: true })
+            } catch (err) {
+              $.ui.toast(`Compact non riuscito: ${err instanceof Error ? err.message : String(err)}`)
             }
-            await refresh($)
           })}
           {action('handoff', '⇢', 'Handoff', 'Passa il lavoro a una nuova sessione', () =>
             $.prompt.fill({
