@@ -4,6 +4,7 @@ Una mod per Claude Code che aggiunge:
 
 - **una fascia sopra il prompt** con file modificati, contesto della chat, limiti a 5 ore e settimanali e costo della sessione. Resta grigia finché va tutto bene e si colora dal 60%. Ha i bottoni Pannello, Compact e Handoff, e si adatta alla larghezza, anche con due chat affiancate;
 - **un pannello "Modifiche"** con l'utilizzo dettagliato (barre, percentuali, tempo al reset) e l'elenco dei file modificati da Claude, ognuno con il suo bottone **↺ Annulla**, che riporta il file a com'era prima delle modifiche;
+- **un suono** quando Claude finisce un lavoro durato più di 30 secondi o si ferma a farti una domanda (solo su Mac). Il bottone ♪ nella fascia lo spegne e lo riaccende;
 - il comando `/change-desk` per riaprire il pannello.
 
 La mod non salva dati suoi: mostra solo quello che Claude Code riporta. I limiti compaiono con la prima risposta del server (prima si vede "—"), e l'elenco dei file di una sessione riaperta viene riletto dalle modifiche registrate nella chat.

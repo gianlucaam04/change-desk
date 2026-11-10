@@ -17,6 +17,18 @@ const lastPrompt = atom({ plugin: 'change-desk', key: 'prompt' } as const, '', {
 const turnNo = atom({ plugin: 'change-desk', key: 'turn' } as const, 0, {
   shape: 'turn-1',
 })
+const muted = atom({ plugin: 'change-desk', key: 'muted' } as const, false, {
+  shape: 'muted-1',
+})
+
+// The sound, and how long a turn must run before its end plays it: quick
+// answers stay silent.
+const SOUND = 'sounds/done.m4a'
+const SOUND_AFTER_MS = 30_000
+const ding = async ($: any) => {
+  if (await read($, muted)) return
+  await $.audio.play({ asset: SOUND }).catch(() => undefined)
+}
 
 const LABELS: Record<string, string> = {
   five_hour: 'Sessione 5h',
@@ -211,6 +223,9 @@ export const register: Register = on => {
     const started = await next(e)
     // Older versions kept the last limits here: the mod now shows only live ones.
     await $.store.delete('limits').catch(() => undefined)
+    // The person's own on/off choice for the sound, kept across sessions.
+    const isMuted = (await $.store.get('muted')) === true
+    await update($, muted, () => isMuted)
     await rebuild($).catch(() => undefined)
     void refresh($).catch(() => undefined)
     return started
@@ -302,6 +317,15 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     await refresh($)
+    if (e.agentId === undefined && e.reason === 'answer' && e.durationMs >= SOUND_AFTER_MS) {
+      void ding($)
+    }
+    return next(e)
+  })
+
+  // Claude stops to ask: sound right away, whatever the time, since it waits.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    if (e.agentId === undefined) void ding($)
     return next(e)
   })
 
@@ -464,6 +488,7 @@ export const register: Register = on => {
         </Text>
       </Box>
     )
+    const isMuted = await read($, muted)
     const action = (id: string, icon: string, label: string, hint: string, onPress: () => unknown) => (
       <Box key={`b-${id}`}>
         <Button key={id} variant="secondary" onPress={onPress}>
@@ -520,6 +545,18 @@ export const register: Register = on => {
           )}
         </Text>
         <Box gap={1} flexShrink={0}>
+          {action(
+            'sound',
+            isMuted ? '♪̸' : '♪',
+            isMuted ? 'Muto' : 'Suono',
+            isMuted ? 'Suono spento: premi per riaccenderlo' : 'Suona quando Claude finisce o ti chiede qualcosa',
+            async () => {
+              const turnOff = !(await read($, muted))
+              await update($, muted, () => turnOff)
+              await $.store.set('muted', turnOff)
+              if (!turnOff) void ding($)
+            },
+          )}
           {action('panel', '▤', 'Pannello', 'Apre il pannello con file, consumi e contesto', () =>
             $.ui.open({ id: PANE, title: 'Modifiche' }),
           )}
