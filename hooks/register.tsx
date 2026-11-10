@@ -429,10 +429,10 @@ export const register: Register = on => {
             $.ui.open({ id: PANE, title: 'Modifiche' }),
           )}
           {action('compact', '⇣', 'Compact', 'Riassume la chat per liberare contesto', async () => {
-            // Sent as if typed: the app runs /compact itself, and queues it
-            // when a turn is still running instead of refusing.
+            // Run as if typed: the engine queues /compact and runs it once the
+            // session is idle, instead of refusing while a turn runs.
             try {
-              await $.prompt.submit({ text: '/compact', asUser: true })
+              await $.command.run({ command: 'compact' })
             } catch (err) {
               $.ui.toast(`Compact non riuscito: ${err instanceof Error ? err.message : String(err)}`)
             }
