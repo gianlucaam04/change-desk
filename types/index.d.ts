@@ -5,15 +5,18 @@ export type Change = {
   before: string | null
   edits: number
   isUndone: boolean
-  // when Claude last edited the file in this entry, in $.clock.now() ms
+  // when Claude last edited the file in this entry, in $.clock.now() ms;
+  // 0 when rebuilt from the transcript, which keeps no time per call
   at: number
-  // lines added and removed, from the file before Claude's first edit to now
+  // lines added and removed, summed from the diffs Claude Code recorded
   added: number
   removed: number
   // number of the prompt that made this edit, counted from the session's start
   turn: number
   // text of the prompt that led to this edit
   prompt: string
+  // true when Claude Code did not record the original (too large): no undo
+  isBeforeLost?: boolean
 }
 export type Limit = { kind: string; percent: number; resetsAt?: string }
 export type Meter = {
@@ -22,9 +25,8 @@ export type Meter = {
   tokens: number
   window: number
   usd: number
+  // empty until the server's first response reports them
   limits: Limit[]
-  // limits read from the last session that had them, until fresh ones arrive
-  isStale: boolean
 }
 
 declare module 'claude-code' {

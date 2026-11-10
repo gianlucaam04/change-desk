@@ -6,7 +6,7 @@ Una mod per Claude Code che aggiunge:
 - **un pannello "Modifiche"** con l'utilizzo dettagliato (barre, percentuali, tempo al reset) e l'elenco dei file modificati da Claude, ognuno con il suo bottone **↺ Annulla**, che riporta il file a com'era prima delle modifiche;
 - il comando `/change-desk` per riaprire il pannello.
 
-Gli ultimi limiti noti vengono ricordati tra una chat e l'altra e mostrati come "ultimo dato" finché il server non manda quelli nuovi.
+La mod non salva dati suoi: mostra solo quello che Claude Code riporta. I limiti compaiono con la prima risposta del server (prima si vede "—"), e l'elenco dei file di una sessione riaperta viene riletto dalle modifiche registrate nella chat.
 
 ## Installazione
 

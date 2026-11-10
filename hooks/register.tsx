@@ -9,7 +9,7 @@ const changes = atom({ plugin: 'change-desk', key: 'changes' } as const, [], {
   shape: 'changes-4',
 })
 const meter = atom({ plugin: 'change-desk', key: 'meter' } as const, null, {
-  shape: 'meter-4',
+  shape: 'meter-5',
 })
 const lastPrompt = atom({ plugin: 'change-desk', key: 'prompt' } as const, '', {
   shape: 'prompt-1',
@@ -31,24 +31,6 @@ const resetIn = (now: number, iso?: string) => {
   return mins >= 60 ? `reset ${Math.floor(mins / 60)}h ${mins % 60}m` : `reset ${mins}m`
 }
 
-// Lines added and removed between two versions of a file, counted as a bag of
-// lines: cheap on big files, and a line that only moved counts as unchanged.
-const lineStats = (before: string | null, after: string | null) => {
-  const left = new Map<string, number>()
-  for (const line of before === null ? [] : before.split('\n')) {
-    left.set(line, (left.get(line) ?? 0) + 1)
-  }
-  let added = 0
-  for (const line of after === null ? [] : after.split('\n')) {
-    const n = left.get(line) ?? 0
-    if (n > 0) left.set(line, n - 1)
-    else added++
-  }
-  let removed = 0
-  for (const n of left.values()) removed += n
-  return { added, removed }
-}
-
 // How long ago, without a clock time: the mod cannot trust the time zone.
 const ago = (now: number, at: number) => {
   const mins = Math.max(0, Math.floor((now - at) / 60000))
@@ -65,12 +47,16 @@ const tokens = (n: number) =>
 // latest one started may write, so an older reading never overwrites a newer.
 let latestRefresh = 0
 
+// After a compaction the session still reports the last response's context
+// fill, from before it. Until a new response arrives (the reported tokens
+// change) the mod shows the size the compaction left instead.
+let compacted: { staleTokens: number | undefined; tokens: number } | null = null
+
 // `figures` is a measurement's own input when the caller has one; otherwise
 // the session is asked.
 const refresh = async ($: any, figures?: any) => {
   const mine = ++latestRefresh
   const u = figures ?? (await $.session.usage())
-  const now = await $.clock.now()
   const m: Meter = {
     percent: u.context?.percent === undefined ? null : Math.round(u.context.percent),
     tokens: u.context?.tokens ?? 0,
@@ -81,33 +67,116 @@ const refresh = async ($: any, figures?: any) => {
       percent: Math.round(l.percentUsed),
       resetsAt: l.resetsAt,
     })),
-    isStale: false,
   }
-  // The server sends the limits with its first answer: until then show the
-  // last ones any session saw, marked stale, leaving out windows that have
-  // reset since (their old figure would be wrong).
-  if (m.limits.length > 0) {
-    await $.store.set('limits', m.limits)
-  } else {
-    const saved = await $.store.get('limits')
-    if (Array.isArray(saved)) {
-      const live = (saved as Meter['limits']).filter(
-        l => l.resetsAt === undefined || Date.parse(l.resetsAt) > now,
-      )
-      if (live.length > 0) {
-        m.limits = live
-        m.isStale = true
-      }
+  if (compacted !== null) {
+    if (u.context?.tokens === compacted.staleTokens && m.window > 0) {
+      m.tokens = compacted.tokens
+      m.percent = Math.min(100, Math.round((compacted.tokens / m.window) * 100))
+    } else {
+      compacted = null
     }
   }
   if (mine !== latestRefresh) return
   await update($, meter, () => m)
 }
 
+// Lines added and removed by one Edit or Write, read from the diff Claude Code
+// itself recorded for the call (`structuredPatch`).
+const patchStats = (patch: unknown) => {
+  let added = 0
+  let removed = 0
+  for (const hunk of Array.isArray(patch) ? patch : []) {
+    for (const line of (hunk?.lines ?? []) as string[]) {
+      if (line.startsWith('+')) added++
+      else if (line.startsWith('-')) removed++
+    }
+  }
+  return { added, removed }
+}
+
+// The file as it was before a call, as Claude Code recorded it. `undefined`:
+// the file existed but its content was too large for Claude Code to record.
+const recordedBefore = (tool: string, result: any): string | null | undefined => {
+  if (typeof result?.originalFile === 'string') return result.originalFile
+  if (tool === 'Write') return result?.type === 'create' ? null : undefined
+  return result?.oldString === '' ? null : undefined
+}
+
+// A file the mod (or anyone) put back as it was is no longer changed: told
+// from the file on disk, compared with Claude Code's record of the original.
+const isReverted = async ($: any, c: Change) => {
+  if (c.isBeforeLost) return false
+  const exists = await $.fs.exists(c.path)
+  if (c.before === null) return !exists
+  return exists && ((await $.fs.read(c.path)) as string) === c.before
+}
+
+// Builds the list from the session's transcript, the Edit and Write calls
+// Claude Code recorded, when the mod holds none (a session opened again).
+// The transcript keeps no time per call: those rows show none.
+const rebuild = async ($: any) => {
+  if ((await read($, changes)).length > 0) return
+  const rows = (await $.session.messages()) as any[]
+  const out: Change[] = []
+  let turn = 0
+  let prompt = ''
+  for (const row of rows) {
+    if (row.role === 'user') {
+      if (row.text !== '' && !(row.toolResults?.length > 0)) {
+        turn++
+        prompt = row.text
+      }
+      continue
+    }
+    for (const use of row.toolUses ?? []) {
+      if (use.tool !== 'Edit' && use.tool !== 'Write') continue
+      const r = use.result as any
+      if (use.isError || r === undefined || r === null || r.staged === true) continue
+      const path: string = r.filePath ?? (use.input?.file_path as string)
+      const stats = patchStats(r.structuredPatch)
+      const first = out.find(c => c.path === path)
+      const same = out.find(c => c.path === path && c.turn === turn)
+      if (same) {
+        same.edits++
+      } else {
+        const before = first ? first.before : recordedBefore(use.tool, r)
+        out.push({
+          path,
+          tool: use.tool,
+          before: before ?? null,
+          isBeforeLost: first ? first.isBeforeLost : before === undefined,
+          edits: 1,
+          isUndone: false,
+          turn,
+          prompt,
+          at: 0,
+          added: 0,
+          removed: 0,
+        })
+      }
+      // every entry of the path carries the file's running total
+      for (const c of out) {
+        if (c.path === path) {
+          c.added = (first?.added ?? 0) + stats.added
+          c.removed = (first?.removed ?? 0) + stats.removed
+        }
+      }
+    }
+  }
+  if (out.length === 0) return
+  const reverted = new Set<string>()
+  for (const path of new Set(out.map(c => c.path))) {
+    const original = out.find(c => c.path === path) as Change
+    if (await isReverted($, original)) reverted.add(path)
+  }
+  await update($, changes, () => out.map(c => (reverted.has(c.path) ? { ...c, isUndone: true } : c)))
+  await update($, turnNo, n => Math.max(n, turn))
+}
+
 // Riporta i file a com'erano prima delle voci date. Dal prompt più recente al
 // più vecchio, così per un file toccato più volte vince lo stato più antico.
 const undoEntries = async ($: any, entries: Change[]) => {
-  const ordered = [...entries].sort((a, b) => b.turn - a.turn)
+  const ordered = [...entries].filter(c => !c.isBeforeLost).sort((a, b) => b.turn - a.turn)
   for (const c of ordered) {
     if (c.before === null) {
       await $.process.run(['rm', '-f', c.path])
@@ -140,6 +209,9 @@ export const register: Register = on => {
     })
     void $.ui.open({ id: PANE, title: 'Modifiche' })
     const started = await next(e)
+    // Older versions kept the last limits here: the mod now shows only live ones.
+    await $.store.delete('limits').catch(() => undefined)
+    await rebuild($).catch(() => undefined)
     void refresh($).catch(() => undefined)
     return started
   })
@@ -157,51 +229,70 @@ export const register: Register = on => {
 
   {
     on('tool.call', { tool: ['Edit', 'Write'] }, async ($, e, next) => {
+      const ran = await next(e)
+      // Only what Claude Code recorded as done: no error, not held for review.
+      const r = (ran as any).result
+      if ('deny' in ran || ran.isError || r === undefined || r === null || r.staged === true) return ran
       const tool = e.tool
-      const path = e.file_path
+      const path: string = r.filePath ?? e.file_path
       const turn = await read($, turnNo)
       const prompt = await read($, lastPrompt)
-      const list = await read($, changes)
-      const known = list.find(c => c.path === path && c.turn === turn && !c.isUndone)
-      if (known) {
+      const stats = patchStats(r.structuredPatch)
+      const at = await $.clock.now()
+      const live = (await read($, changes)).filter(c => c.path === path && !c.isUndone)
+      const first = [...live].sort((x, y) => x.turn - y.turn)[0]
+      const added = (first?.added ?? 0) + stats.added
+      const removed = (first?.removed ?? 0) + stats.removed
+      if (live.some(c => c.turn === turn)) {
         await update($, changes, l =>
-          l.map(c => (c === known ? { ...c, edits: c.edits + 1 } : c)),
+          l.map(c =>
+            c.path === path && !c.isUndone
+              ? { ...c, added, removed, ...(c.turn === turn ? { edits: c.edits + 1, at } : {}) }
+              : c,
+          ),
         )
       } else {
-        const before = (await $.fs.exists(path))
-          ? ((await $.fs.read(path)) as string)
-          : null
+        const before = first ? first.before : recordedBefore(tool, r)
         const c: Change = {
           path,
           tool,
-          before,
+          before: before ?? null,
+          isBeforeLost: first ? first.isBeforeLost : before === undefined,
           edits: 1,
           isUndone: false,
           turn,
           prompt,
-          at: await $.clock.now(),
-          added: 0,
-          removed: 0,
+          at,
+          added,
+          removed,
         }
-        await update($, changes, l => [...l, c].slice(-200))
-      }
-      const ran = await next(e)
-      // Measure the file against how it was before Claude's first edit to it,
-      // and stamp this turn's entry with the time and the count.
-      const live = (await read($, changes)).filter(c => c.path === path && !c.isUndone)
-      const original = [...live].sort((a, b) => a.turn - b.turn)[0]
-      if (original !== undefined) {
-        const current = (await $.fs.exists(path)) ? ((await $.fs.read(path)) as string) : null
-        const stats = lineStats(original.before, current)
-        const at = await $.clock.now()
-        await update($, changes, l =>
-          l.map(c => (c.path === path && c.turn === turn && !c.isUndone ? { ...c, at, ...stats } : c)),
-        )
+        await update($, changes, l => [
+          ...l.map(o => (o.path === path && !o.isUndone ? { ...o, added, removed } : o)),
+          c,
+        ].slice(-200))
       }
       await refresh($)
       return ran
     })
   }
+
+  on('session.compact', async ($, e, next) => {
+    if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
+    const before = await $.session.usage()
+    const done = await next(e)
+    if (done.skip === undefined) {
+      let after = done.tokensAfter
+      if (after === undefined) {
+        const est = await $.session.usage({ breakdown: 'summary' }).catch(() => undefined)
+        after = est?.context.breakdown?.totalTokens
+      }
+      if (after !== undefined) {
+        compacted = { staleTokens: before.context.tokens, tokens: after }
+        await refresh($).catch(() => undefined)
+      }
+    }
+    return done
+  })
 
   on('session.measure', async ($, e, next) => {
     const measured = await next(e)
@@ -266,13 +357,10 @@ export const register: Register = on => {
           {m === null && <Text dimColor>In attesa dei dati…</Text>}
           {m !== null &&
             m.limits.map(l =>
-              meterRow(
-                l.kind,
-                LABELS[l.kind] ?? l.kind,
-                l.percent,
-                m.isStale ? 'ultimo dato' : resetIn(now, l.resetsAt),
-              ),
+              meterRow(l.kind, LABELS[l.kind] ?? l.kind, l.percent, resetIn(now, l.resetsAt)),
             )}
+          {(m === null || m.limits.length === 0) &&
+            meterRow('lim', 'Limiti', null, 'dopo la prima risposta')}
           {m !== null &&
             meterRow('ctx', 'Contesto chat', m.percent, `${tokens(m.tokens)} / ${tokens(m.window)}`)}
           {m !== null && (
@@ -292,7 +380,8 @@ export const register: Register = on => {
           {paths.length === 0 && <Text dimColor>Nessuna modifica in questa sessione.</Text>}
           {paths.map(path => {
             const mine = all.filter(c => c.path === path)
-            const isNew = mine[0]?.before === null
+            const isNew = mine[0]?.before === null && mine[0]?.isBeforeLost !== true
+            const canUndo = mine.some(c => !c.isBeforeLost)
             const parts = path.split('/')
             const name = parts[parts.length - 1] ?? path
             const folder = parts.length > 1 ? (parts[parts.length - 2] ?? '') + '/' : ''
@@ -322,13 +411,17 @@ export const register: Register = on => {
                 </Box>
                 {isWide && (
                   <Box width={timeCols} flexShrink={0} justifyContent="flex-end">
-                    <Text dimColor>{latest === undefined ? '' : ago(now, latest.at)}</Text>
+                    <Text dimColor>{latest === undefined || latest.at === 0 ? '' : ago(now, latest.at)}</Text>
                   </Box>
                 )}
                 <Box width={buttonCols} flexShrink={0} justifyContent="flex-end">
-                  <Button key={`u-${path}`} variant="secondary" onPress={() => undoEntries($, mine)}>
-                    <Text>{isWide ? '↺ Annulla' : '↺'}</Text>
-                  </Button>
+                  {canUndo ? (
+                    <Button key={`u-${path}`} variant="secondary" onPress={() => undoEntries($, mine)}>
+                      <Text>{isWide ? '↺ Annulla' : '↺'}</Text>
+                    </Button>
+                  ) : (
+                    <Text dimColor>{isWide ? 'non annull.' : '–'}</Text>
+                  )}
                 </Box>
               </Box>
             )
@@ -406,15 +499,17 @@ export const register: Register = on => {
                 <Text key={l.kind}>
                   {dot()}
                   <Text dimColor>{short(l.kind)} </Text>
-                  {m.isStale ? (
-                    <Text dimColor>~{l.percent}%</Text>
-                  ) : (
-                    <Text color={alert(l.percent)} dimColor={l.percent < 60} bold={l.percent >= 60}>
-                      {l.percent}%
-                    </Text>
-                  )}
+                  <Text color={alert(l.percent)} dimColor={l.percent < 60} bold={l.percent >= 60}>
+                    {l.percent}%
+                  </Text>
                 </Text>
               ))}
+              {limits.length === 0 && (
+                <Text>
+                  {dot()}
+                  <Text dimColor>5h —</Text>
+                </Text>
+              )}
               {isFull && (
                 <Text>
                   {dot()}
