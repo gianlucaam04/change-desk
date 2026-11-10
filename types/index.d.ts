@@ -37,6 +37,7 @@ declare module 'claude-code' {
       turn: Shaped<number>
       prompt: Shaped<string>
       muted: Shaped<boolean>
+      track: Shaped<string>
     }
   }
 }

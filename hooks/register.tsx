@@ -21,13 +21,27 @@ const muted = atom({ plugin: 'change-desk', key: 'muted' } as const, false, {
   shape: 'muted-1',
 })
 
-// The sound, and how long a turn must run before its end plays it: quick
-// answers stay silent.
-const SOUND = 'sounds/done.m4a'
+const track = atom({ plugin: 'change-desk', key: 'track' } as const, 'full', {
+  shape: 'track-1',
+})
+
+// The mod's own sounds, the first the default, and how long a turn must run
+// before its end plays one: quick answers stay silent.
+const TRACKS = [
+  { id: 'full', name: 'Completo', file: 'sounds/done.m4a', secs: '3 s' },
+  { id: 'oh-yeah', name: 'Solo "oh yeah"', file: 'sounds/oh-yeah.m4a', secs: '1,5 s' },
+] as const
 const SOUND_AFTER_MS = 30_000
+const fileOf = (id: string) => (TRACKS.find(t => t.id === id) ?? TRACKS[0]).file
+const play = ($: any, id: string) => $.audio.play({ asset: fileOf(id) }).catch(() => undefined)
 const ding = async ($: any) => {
   if (await read($, muted)) return
-  await $.audio.play({ asset: SOUND }).catch(() => undefined)
+  await play($, await read($, track))
+}
+const setMuted = async ($: any, isOff: boolean) => {
+  await update($, muted, () => isOff)
+  await $.store.set('muted', isOff)
+  if (!isOff) void ding($)
 }
 
 const LABELS: Record<string, string> = {
@@ -226,6 +240,8 @@ export const register: Register = on => {
     // The person's own on/off choice for the sound, kept across sessions.
     const isMuted = (await $.store.get('muted')) === true
     await update($, muted, () => isMuted)
+    const chosen = await $.store.get('track')
+    if (TRACKS.some(t => t.id === chosen)) await update($, track, () => chosen as string)
     await rebuild($).catch(() => undefined)
     void refresh($).catch(() => undefined)
     return started
@@ -371,6 +387,10 @@ export const register: Register = on => {
     const statsCols = 10
     const timeCols = isWide ? 6 : 0
     const nameRoom = Math.max(8, cols - 2 - 1 - statsCols - timeCols - buttonCols - 5)
+    const isMuted = await read($, muted)
+    const chosen = await read($, track)
+    const playCols = isWide ? 11 : 4
+    const pickCols = isWide ? 9 : 4
     const fit = (text: string, room: number) =>
       text.length <= room ? text : text.slice(0, Math.max(1, room - 1)) + '…'
 
@@ -453,6 +473,64 @@ export const register: Register = on => {
           {paths.length > 0 && (
             <Text dimColor>↺ riporta il file a com'era prima delle modifiche di Claude.</Text>
           )}
+        </Box>
+        <Box flexDirection="column">
+          <Box gap={1}>
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Text wrap="truncate-end">
+                <Text bold>Suono</Text>
+                <Text dimColor> · {isMuted ? 'spento' : 'acceso'}</Text>
+              </Text>
+            </Box>
+            <Box width={pickCols} flexShrink={0} justifyContent="flex-end">
+              <Button key="mute" variant="secondary" onPress={() => setMuted($, !isMuted)}>
+                <Text>{isWide ? (isMuted ? 'Accendi' : 'Spegni') : isMuted ? '♪' : '♪̸'}</Text>
+              </Button>
+            </Box>
+          </Box>
+          {TRACKS.map(t => {
+            const isChosen = t.id === chosen
+            return (
+              <Box key={`t-${t.id}`} gap={1}>
+                <Box width={1} flexShrink={0}>
+                  <Text color={isChosen ? 'success' : undefined} dimColor={!isChosen}>
+                    {isChosen ? '●' : '○'}
+                  </Text>
+                </Box>
+                <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                  <Text wrap="truncate-end" bold={isChosen} dimColor={!isChosen}>
+                    {t.name}
+                    {isWide && <Text dimColor>  {t.secs}</Text>}
+                  </Text>
+                </Box>
+                <Box width={playCols} flexShrink={0} justifyContent="flex-end">
+                  <Button key={`p-${t.id}`} variant="secondary" onPress={() => play($, t.id)}>
+                    <Text>{isWide ? '▶ Ascolta' : '▶'}</Text>
+                  </Button>
+                </Box>
+                <Box width={pickCols} flexShrink={0} justifyContent="flex-end">
+                  {isChosen ? (
+                    <Text dimColor>{isWide ? 'in uso' : '✓'}</Text>
+                  ) : (
+                    <Button
+                      key={`c-${t.id}`}
+                      variant="secondary"
+                      onPress={async () => {
+                        await update($, track, () => t.id)
+                        await $.store.set('track', t.id)
+                        void play($, t.id)
+                      }}
+                    >
+                      <Text>{isWide ? 'Usa' : '✓'}</Text>
+                    </Button>
+                  )}
+                </Box>
+              </Box>
+            )
+          })}
+          <Text dimColor wrap="wrap">
+            Suona quando Claude finisce un lavoro di oltre 30 secondi o ti fa una domanda. Solo su Mac.
+          </Text>
         </Box>
       </Box>
     )
@@ -550,12 +628,7 @@ export const register: Register = on => {
             isMuted ? '♪̸' : '♪',
             isMuted ? 'Muto' : 'Suono',
             isMuted ? 'Suono spento: premi per riaccenderlo' : 'Suona quando Claude finisce o ti chiede qualcosa',
-            async () => {
-              const turnOff = !(await read($, muted))
-              await update($, muted, () => turnOff)
-              await $.store.set('muted', turnOff)
-              if (!turnOff) void ding($)
-            },
+            async () => setMuted($, !(await read($, muted))),
           )}
           {action('panel', '▤', 'Pannello', 'Apre il pannello con file, consumi e contesto', () =>
             $.ui.open({ id: PANE, title: 'Modifiche' }),

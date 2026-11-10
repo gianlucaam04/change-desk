@@ -1,1 +1,1 @@
-{ "name": "change-desk", "version": "0.9.1", "description": "Pannello con i file modificati da Claude, annulla modifiche, consumi e contesto", "types": "./types/index.d.ts" }
+{ "name": "change-desk", "version": "0.10.0", "description": "Pannello con i file modificati da Claude, annulla modifiche, consumi e contesto", "types": "./types/index.d.ts" }
