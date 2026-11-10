@@ -6,7 +6,7 @@ import type { Change, Meter } from '../types'
 
 const PANE = 'change-desk'
 const changes = atom({ plugin: 'change-desk', key: 'changes' } as const, [], {
-  shape: 'changes-3',
+  shape: 'changes-4',
 })
 const meter = atom({ plugin: 'change-desk', key: 'meter' } as const, null, {
   shape: 'meter-4',
@@ -29,6 +29,33 @@ const resetIn = (now: number, iso?: string) => {
   const mins = Math.max(0, Math.round((Date.parse(iso) - now) / 60000))
   if (mins >= 1440) return `reset ${Math.floor(mins / 1440)}g ${Math.floor((mins % 1440) / 60)}h`
   return mins >= 60 ? `reset ${Math.floor(mins / 60)}h ${mins % 60}m` : `reset ${mins}m`
+}
+
+// Lines added and removed between two versions of a file, counted as a bag of
+// lines: cheap on big files, and a line that only moved counts as unchanged.
+const lineStats = (before: string | null, after: string | null) => {
+  const left = new Map<string, number>()
+  for (const line of before === null ? [] : before.split('\n')) {
+    left.set(line, (left.get(line) ?? 0) + 1)
+  }
+  let added = 0
+  for (const line of after === null ? [] : after.split('\n')) {
+    const n = left.get(line) ?? 0
+    if (n > 0) left.set(line, n - 1)
+    else added++
+  }
+  let removed = 0
+  for (const n of left.values()) removed += n
+  return { added, removed }
+}
+
+// How long ago, without a clock time: the mod cannot trust the time zone.
+const ago = (now: number, at: number) => {
+  const mins = Math.max(0, Math.floor((now - at) / 60000))
+  if (mins < 1) return 'ora'
+  if (mins < 60) return `${mins}m fa`
+  if (mins < 1440) return `${Math.floor(mins / 60)}h fa`
+  return `${Math.floor(mins / 1440)}g fa`
 }
 
 const tokens = (n: number) =>
@@ -144,10 +171,33 @@ export const register: Register = on => {
         const before = (await $.fs.exists(path))
           ? ((await $.fs.read(path)) as string)
           : null
-        const c: Change = { path, tool, before, edits: 1, isUndone: false, turn, prompt }
+        const c: Change = {
+          path,
+          tool,
+          before,
+          edits: 1,
+          isUndone: false,
+          turn,
+          prompt,
+          at: await $.clock.now(),
+          added: 0,
+          removed: 0,
+        }
         await update($, changes, l => [...l, c].slice(-200))
       }
       const ran = await next(e)
+      // Measure the file against how it was before Claude's first edit to it,
+      // and stamp this turn's entry with the time and the count.
+      const live = (await read($, changes)).filter(c => c.path === path && !c.isUndone)
+      const original = [...live].sort((a, b) => a.turn - b.turn)[0]
+      if (original !== undefined) {
+        const current = (await $.fs.exists(path)) ? ((await $.fs.read(path)) as string) : null
+        const stats = lineStats(original.before, current)
+        const at = await $.clock.now()
+        await update($, changes, l =>
+          l.map(c => (c.path === path && c.turn === turn && !c.isUndone ? { ...c, at, ...stats } : c)),
+        )
+      }
       await refresh($)
       return ran
     })
@@ -167,7 +217,9 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const all = (await read($, changes)).filter(c => !c.isUndone)
-    const paths = [...new Set(all.map(c => c.path))]
+    // Most recently edited first, so what Claude is touching now is on top.
+    const lastAt = (path: string) => Math.max(...all.filter(c => c.path === path).map(c => c.at))
+    const paths = [...new Set(all.map(c => c.path))].sort((a, b) => lastAt(b) - lastAt(a))
     const m = await read($, meter)
     const now = await $.clock.now()
     const cols = e.props.bodyColumns ?? 40
@@ -197,10 +249,13 @@ export const register: Register = on => {
       </Box>
     )
 
-    // A row is a sign, the file's name, its edit count and the button, the last
-    // two in fixed columns: the name is cut to fit so the button never moves.
+    // A row is a sign, the file's name, its lines added and removed, how long
+    // ago it changed and the button, all but the name in fixed columns: the
+    // name is cut to fit so nothing after it moves.
     const buttonCols = isWide ? 11 : 4
-    const nameRoom = Math.max(8, cols - 2 - 2 - 4 - buttonCols - 4)
+    const statsCols = 10
+    const timeCols = isWide ? 6 : 0
+    const nameRoom = Math.max(8, cols - 2 - 1 - statsCols - timeCols - buttonCols - 5)
     const fit = (text: string, room: number) =>
       text.length <= room ? text : text.slice(0, Math.max(1, room - 1)) + '…'
 
@@ -241,7 +296,7 @@ export const register: Register = on => {
             const parts = path.split('/')
             const name = parts[parts.length - 1] ?? path
             const folder = parts.length > 1 ? (parts[parts.length - 2] ?? '') + '/' : ''
-            const edits = mine.reduce((n, c) => n + c.edits, 0)
+            const latest = [...mine].sort((a, b) => b.at - a.at)[0]
             const shownName = fit(name, nameRoom)
             const folderRoom = nameRoom - shownName.length - 2
             const shownFolder = folder !== '' && folderRoom >= 4 ? fit(folder, folderRoom) : ''
@@ -258,9 +313,18 @@ export const register: Register = on => {
                     {shownFolder !== '' && <Text dimColor>  {shownFolder}</Text>}
                   </Text>
                 </Box>
-                <Box width={4} flexShrink={0} justifyContent="flex-end">
-                  <Text dimColor>{edits > 1 ? `×${edits}` : ''}</Text>
+                <Box width={statsCols} flexShrink={0} justifyContent="flex-end">
+                  <Text>
+                    <Text color="diffAdded">+{latest?.added ?? 0}</Text>
+                    <Text dimColor> </Text>
+                    <Text color="diffRemoved">−{latest?.removed ?? 0}</Text>
+                  </Text>
                 </Box>
+                {isWide && (
+                  <Box width={timeCols} flexShrink={0} justifyContent="flex-end">
+                    <Text dimColor>{latest === undefined ? '' : ago(now, latest.at)}</Text>
+                  </Box>
+                )}
                 <Box width={buttonCols} flexShrink={0} justifyContent="flex-end">
                   <Button key={`u-${path}`} variant="secondary" onPress={() => undoEntries($, mine)}>
                     <Text>{isWide ? '↺ Annulla' : '↺'}</Text>

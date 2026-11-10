@@ -5,6 +5,11 @@ export type Change = {
   before: string | null
   edits: number
   isUndone: boolean
+  // when Claude last edited the file in this entry, in $.clock.now() ms
+  at: number
+  // lines added and removed, from the file before Claude's first edit to now
+  added: number
+  removed: number
   // number of the prompt that made this edit, counted from the session's start
   turn: number
   // text of the prompt that led to this edit
